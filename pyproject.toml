@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "live-caption"
+version = "0.1.0"
+description = "A small Windows live-caption overlay for the Local Dictation API"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "keyring>=25",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+package = ["pyinstaller>=6"]
+
+[project.scripts]
+live-caption = "live_caption.__main__:main"
+
+[project.gui-scripts]
+LocalDictationCaptions = "live_caption.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
