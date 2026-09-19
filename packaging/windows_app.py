@@ -4,4 +4,5 @@ from live_caption.__main__ import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(default_mode="real"))
+

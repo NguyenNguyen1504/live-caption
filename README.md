@@ -1,9 +1,11 @@
 # Live Caption
 
 A focused Windows desktop client for the local real-time API documented in
-[API.md](API.md). It renders progressive, YouTube-style captions in a
-bottom-center, always-on-top overlay and is controlled from the Windows system
-tray.
+[API.md](API.md). It renders progressive captions in a bottom-center,
+always-on-top overlay controlled from the Windows system tray. The captions are
+styled after YouTube's automatic captions: white proportional sans-serif on a
+translucent black box per line, two lines at most, words revealed one at a
+time, and older lines rolling up.
 
 ## Windows Quick Start
 

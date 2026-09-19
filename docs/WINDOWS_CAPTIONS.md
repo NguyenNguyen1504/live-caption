@@ -8,6 +8,24 @@ The caption overlay shows at most two recent lines at the bottom-center of the
 primary Windows work area. It is always on top, absent from the taskbar and
 Alt-Tab, does not take keyboard focus, and lets mouse clicks pass through it.
 
+## Caption appearance
+
+The overlay copies YouTube's automatic captions:
+
+- **Font.** YouTube's default "Proportional Sans-Serif" (Roboto), falling back
+  to Arial and then Segoe UI. Regular weight, white, no outline or shadow.
+- **Box.** Each line carries its own translucent black box, only as wide as
+  that line's text, and consecutive boxes touch with no gap between them.
+- **Lines.** Two at most, wrapped to roughly 45 characters rather than to the
+  full screen width. The block is bottom-anchored, so a second line grows
+  upward instead of pushing the first one down.
+- **Appearing.** Words are revealed one at a time. A revision that adds several
+  words at once cascades in instead of snapping in as a block, and the first
+  word of an utterance is never held back.
+- **Disappearing.** A line that fills up is frozen and rolls up; it never
+  re-wraps afterwards, and it scrolls off the top when a third line begins.
+  When the session stops, the caption holds briefly and then fades out.
+
 ## Fastest way to test Demo Mode
 
 On a Windows 10 or 11 machine with Python 3.12 from python.org:

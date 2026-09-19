@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import os
 import sys
 
 from live_caption.client import Endpoint
@@ -14,7 +15,7 @@ from live_caption.credentials import (
 )
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, default_mode: str = "demo") -> int:
     parser = argparse.ArgumentParser(
         prog="live-caption",
         description="Show live dictation captions in a Windows bottom-screen overlay.",
@@ -24,10 +25,16 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_ENDPOINT,
         help="loopback API endpoint (default: %(default)s)",
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--real",
         action="store_true",
         help="start in Real API Mode instead of the default Demo Mode",
+    )
+    mode_group.add_argument(
+        "--demo",
+        action="store_true",
+        help="start in Demo Mode",
     )
     action = parser.add_mutually_exclusive_group()
     action.add_argument(
@@ -73,12 +80,21 @@ def main(argv: list[str] | None = None) -> int:
         print("error: the live-caption overlay currently supports Windows only", file=sys.stderr)
         return 1
 
+    if args.real:
+        mode = "real"
+    elif args.demo:
+        mode = "demo"
+    else:
+        mode = os.environ.get("LIVE_CAPTION_MODE", default_mode).lower().strip()
+    if mode not in {"demo", "real"}:
+        mode = "demo"
+
     from live_caption.overlay import CaptionOverlay
 
     try:
         CaptionOverlay(
             credentials,
-            initial_mode="real" if args.real else "demo",
+            initial_mode=mode,
         ).run()
     except KeyboardInterrupt:
         return 0

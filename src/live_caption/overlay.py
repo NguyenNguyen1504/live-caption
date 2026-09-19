@@ -1,4 +1,10 @@
-"""Non-activating, always-on-top Windows caption overlay."""
+"""Non-activating, always-on-top Windows caption overlay.
+
+The presentation deliberately copies YouTube's automatic captions: a
+proportional sans-serif face, white text with no character edge, a translucent
+black box hugging each line separately, at most two lines, words revealed one
+at a time, and a roll-up whose bottom edge stays anchored above the taskbar.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +12,9 @@ import ctypes
 import queue
 import sys
 import threading
+import time
 from ctypes import wintypes
-from typing import Any
+from typing import Any, Sequence
 
 from live_caption.client import Endpoint, LocalApiClient
 from live_caption.credentials import (
@@ -19,6 +26,33 @@ from live_caption.model import CaptionState
 from live_caption.source import DemoWorker, Notice, StreamWorker
 
 CAPTION_HOLD_MS = 2500
+
+# YouTube's default caption style: "Proportional Sans-Serif" (Roboto), 100%
+# white text, a black background at 75% opacity, and no character edge.
+CAPTION_FONT_CANDIDATES = ("Roboto", "Arial", "Helvetica", "Segoe UI")
+CAPTION_FONT_SIZE = 24
+CAPTION_FOREGROUND = "#ffffff"
+CAPTION_BACKGROUND = "#000000"
+CAPTION_PAD_X = 10
+CAPTION_PAD_Y = 3
+# A layered window applies one alpha to text and box alike, so this sits above
+# YouTube's 75% background to keep the glyphs themselves crisp.
+CAPTION_ALPHA = 0.85
+CAPTION_LINES = 2
+# YouTube breaks automatic captions into short lines instead of filling the
+# player. Measuring an average-width sample keeps that rhythm at any font size
+# or DPI, and the screen fraction caps it on a narrow display.
+CAPTION_LINE_CHARACTERS = 45
+CAPTION_WIDTH_SAMPLE = "the quick brown fox jumps over the lazy dog"
+CAPTION_WIDTH_FRACTION = 0.62
+CAPTION_BOTTOM_FRACTION = 0.06
+CAPTION_BOTTOM_MIN = 40
+# YouTube appends one recognized word at a time. Pacing the reveal makes a
+# multi-word revision cascade in rather than snap in as a block.
+REVEAL_INTERVAL_MS = 45
+REVEAL_CATCHUP = 3
+FADE_MS = 200
+FADE_STEPS = 8
 
 
 class CaptionOverlay:
@@ -43,18 +77,13 @@ class CaptionOverlay:
         if sys.platform == "win32":
             self.root.wm_attributes("-transparentcolor", self.transparent)
 
-        self.font = tkfont.Font(family="Segoe UI", size=22, weight="bold")
-        self.label = tk.Label(
-            self.root,
-            background="#080808",
-            foreground="white",
-            font=self.font,
-            justify="center",
-            padx=12,
-            pady=6,
-            borderwidth=0,
+        self.font = tkfont.Font(
+            family=_caption_family(tkfont), size=CAPTION_FONT_SIZE, weight="normal"
         )
-        self.label.pack()
+        # One label per caption line: each box is only as wide as its own text.
+        self.body = tk.Frame(self.root, background=self.transparent)
+        self.body.pack(fill="both", expand=True)
+        self._lines: list[Any] = []
         self.state = CaptionState()
         self.notices: queue.SimpleQueue[Notice] = queue.SimpleQueue()
         self.commands: queue.SimpleQueue[str] = queue.SimpleQueue()
@@ -70,7 +99,15 @@ class CaptionOverlay:
         self._fallback_window: Any = None
         self._fallback_toggle: Any = None
         self._hide_generation = 0
-        self._max_width = max(320, int(self.root.winfo_screenwidth() * 0.78))
+        self._fade_generation = 0
+        self._target_words: tuple[str, ...] = ()
+        self._revealed = 0
+        self._last_reveal = 0.0
+        self._max_width = _line_width(self.font, self.root.winfo_screenwidth())
+        self.layout = RollUpLines(self.font.measure, self._max_width)
+        # Claim the layered window's alpha before the extended styles are set,
+        # so a later fade only rewrites the alpha byte.
+        self._set_alpha(CAPTION_ALPHA)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def run(self) -> None:
@@ -189,6 +226,7 @@ class CaptionOverlay:
                 self._handle_command(self.commands.get_nowait())
         except queue.Empty:
             pass
+        self._advance_reveal()
         if not self._closed:
             self.root.after(16, self._poll)
 
@@ -339,56 +377,208 @@ class CaptionOverlay:
 
     def _show(self, text: str) -> None:
         self._hide_generation += 1
-        if not text:
-            self.root.withdraw()
+        words = tuple(text.split())
+        if not words:
+            self._target_words = ()
+            self._revealed = 0
+            self.layout.reset()
+            self._hide_now()
             return
-        recent = fit_recent_lines(text, self.font.measure, self._max_width, max_lines=2)
-        self.label.configure(text=recent)
+        self._target_words = words
+        # A revision can shorten the transcript; never reveal past its end.
+        self._revealed = min(self._revealed, len(words))
+        if self._revealed == 0:
+            # The first word of an utterance is never held back.
+            self._revealed = 1
+            self._last_reveal = time.monotonic()
+        self._render()
+
+    def _advance_reveal(self) -> None:
+        """Let queued words appear one at a time, the way YouTube types them."""
+        pending = len(self._target_words) - self._revealed
+        if pending <= 0:
+            return
+        now = time.monotonic()
+        if (now - self._last_reveal) * 1000 < REVEAL_INTERVAL_MS:
+            return
+        self._last_reveal = now
+        # Catch up proportionally so a burst never falls behind the speaker.
+        self._revealed += max(1, pending // REVEAL_CATCHUP)
+        self._render()
+
+    def _render(self) -> None:
+        lines = self.layout.lines(self._target_words[: self._revealed])
+        if not lines:
+            self._hide_now()
+            return
+        self._present(lines)
+
+    def _present(self, lines: list[str]) -> None:
+        self._sync_line_widgets(lines)
         self.root.update_idletasks()
-        width = min(self.label.winfo_reqwidth(), self._max_width + 24)
-        height = self.label.winfo_reqheight()
         left, top, right, bottom = _work_area(self.root)
+        width = min(self.body.winfo_reqwidth(), right - left)
+        height = self.body.winfo_reqheight()
+        margin = max(CAPTION_BOTTOM_MIN, int((bottom - top) * CAPTION_BOTTOM_FRACTION))
         x = left + max(0, (right - left - width) // 2)
-        y = top + max(0, bottom - top - height - 36)
+        # Bottom-anchored, so a second line grows upward instead of pushing the
+        # current line down.
+        y = top + max(0, bottom - top - height - margin)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self._fade_generation += 1
+        self._set_alpha(CAPTION_ALPHA)
         self.root.deiconify()
         self.root.lift()
+
+    def _sync_line_widgets(self, lines: list[str]) -> None:
+        while len(self._lines) < len(lines):
+            self._lines.append(
+                self.tk.Label(
+                    self.body,
+                    background=CAPTION_BACKGROUND,
+                    foreground=CAPTION_FOREGROUND,
+                    font=self.font,
+                    justify="center",
+                    padx=CAPTION_PAD_X,
+                    pady=CAPTION_PAD_Y,
+                    borderwidth=0,
+                )
+            )
+        for index, label in enumerate(self._lines):
+            if index < len(lines):
+                label.configure(text=lines[index])
+                # No gap between boxes: consecutive lines touch, as on YouTube.
+                label.pack(side="top", anchor="center", pady=0)
+            else:
+                label.pack_forget()
+
+    def _set_alpha(self, value: float) -> None:
+        try:
+            self.root.attributes("-alpha", max(0.0, min(1.0, value)))
+        except self.tk.TclError:
+            pass
+
+    def _hide_now(self) -> None:
+        self._fade_generation += 1
+        self.root.withdraw()
+        self._set_alpha(CAPTION_ALPHA)
+
+    def _fade_out(self, step: int, generation: int) -> None:
+        if self._closed or generation != self._fade_generation:
+            return
+        if step >= FADE_STEPS:
+            self._hide_now()
+            return
+        self._set_alpha(CAPTION_ALPHA * (1 - (step + 1) / FADE_STEPS))
+        self.root.after(
+            max(1, FADE_MS // FADE_STEPS),
+            lambda: self._fade_out(step + 1, generation),
+        )
 
     def _schedule_hide(self) -> None:
         self._hide_generation += 1
         generation = self._hide_generation
 
-        def hide_if_unchanged() -> None:
-            if generation == self._hide_generation:
-                self.state.reset()
-                self.root.withdraw()
+        def fade_if_unchanged() -> None:
+            if generation != self._hide_generation:
+                return
+            self.state.reset()
+            self._target_words = ()
+            self._revealed = 0
+            self.layout.reset()
+            self._fade_generation += 1
+            self._fade_out(0, self._fade_generation)
 
-        self.root.after(CAPTION_HOLD_MS, hide_if_unchanged)
+        self.root.after(CAPTION_HOLD_MS, fade_if_unchanged)
 
 
-def fit_recent_lines(
-    text: str,
-    measure: Any,
-    max_width: int,
-    *,
-    max_lines: int,
-) -> str:
-    """Word-wrap text and retain only the most recent visible lines."""
-    words = text.split()
-    if not words:
-        return ""
-    lines: list[str] = []
-    current = ""
+class RollUpLines:
+    """YouTube-style roll-up layout for a growing, revisable transcript.
+
+    A line is frozen as soon as the next word no longer fits it, so text that
+    has already rolled up never reflows: only the bottom line grows, exactly
+    like an automatic caption track. Revisions to the mutable tail are
+    absorbed; a transcript that no longer matches the frozen lines is re-laid
+    out from scratch.
+    """
+
+    def __init__(
+        self, measure: Any, max_width: int, *, max_lines: int = CAPTION_LINES
+    ) -> None:
+        self.measure = measure
+        self.max_width = max_width
+        self.max_lines = max_lines
+        self._locked: list[list[str]] = []
+        # Words dropped with lines that have scrolled off the top. Keeping the
+        # count bounds the work per update to the visible caption, not to the
+        # whole session transcript.
+        self._dropped = 0
+
+    def reset(self) -> None:
+        self._locked = []
+        self._dropped = 0
+
+    def lines(self, words: Sequence[str]) -> list[str]:
+        consumed = self._dropped + sum(len(line) for line in self._locked)
+        if not self._holds(words, consumed):
+            self.reset()
+            consumed = 0
+        wrapped = wrap_words(words[consumed:], self.measure, self.max_width)
+        if len(wrapped) > 1:
+            # Every finished line but the last is frozen: the newest word
+            # starts a fresh bottom line and older lines roll up unchanged.
+            self._locked.extend(wrapped[:-1])
+            while len(self._locked) > self.max_lines:
+                self._dropped += len(self._locked.pop(0))
+        visible = (self._locked + wrapped[-1:])[-self.max_lines :]
+        return [" ".join(line) for line in visible]
+
+    def _holds(self, words: Sequence[str], consumed: int) -> bool:
+        """Report whether the frozen lines still match this transcript."""
+        if len(words) < consumed:
+            return False
+        if not self._locked:
+            return consumed == 0
+        anchor = self._locked[-1]
+        return list(words[consumed - len(anchor) : consumed]) == anchor
+
+
+def wrap_words(
+    words: Sequence[str], measure: Any, max_width: int
+) -> list[list[str]]:
+    """Greedily word-wrap into lines, each returned as its own word list."""
+    lines: list[list[str]] = []
+    current: list[str] = []
     for word in words:
-        candidate = word if not current else f"{current} {word}"
-        if current and measure(candidate) > max_width:
+        if current and measure(" ".join((*current, word))) > max_width:
             lines.append(current)
-            current = word
+            current = [word]
         else:
-            current = candidate
+            current.append(word)
     if current:
         lines.append(current)
-    return "\n".join(lines[-max_lines:])
+    return lines
+
+
+def _line_width(font: Any, screen_width: int) -> int:
+    """Size a caption line in characters, the way a caption track reads."""
+    average = font.measure(CAPTION_WIDTH_SAMPLE) / len(CAPTION_WIDTH_SAMPLE)
+    return max(
+        320,
+        min(
+            int(average * CAPTION_LINE_CHARACTERS),
+            int(screen_width * CAPTION_WIDTH_FRACTION),
+        ),
+    )
+
+
+def _caption_family(tkfont: Any) -> str:
+    """Pick the closest available face to YouTube's proportional sans-serif."""
+    available = {name.lower() for name in tkfont.families()}
+    for family in CAPTION_FONT_CANDIDATES:
+        if family.lower() in available:
+            return family
+    return "TkDefaultFont"
 
 
 def _make_nonactivating(window_id: int) -> None:

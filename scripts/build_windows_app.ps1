@@ -4,7 +4,15 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
 if (-not (Test-Path ".venv\Scripts\python.exe")) {
-    py -3.12 -m venv .venv
+    $pythonCmd = (Get-Command py.exe, python.exe -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($null -eq $pythonCmd) {
+        throw "Python was not found on PATH. Install Python 3.12 or newer."
+    }
+    if ($pythonCmd.Name -eq "py.exe") {
+        & py -3 -m venv .venv
+    } else {
+        & python -m venv .venv
+    }
 }
 
 & .venv\Scripts\python.exe -m pip install -e ".[package]"
@@ -20,4 +28,5 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 
 Write-Host ""
 Write-Host "Built: $RepoRoot\dist\LocalDictationCaptions.exe"
-Write-Host "Double-click that file to start immediately in Demo Mode."
+Write-Host "Double-click that file to start immediately in Real API Mode."
+

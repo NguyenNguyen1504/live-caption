@@ -24,7 +24,7 @@ from live_caption.model import (
     SOFT_SEGMENT_WORDS,
     CaptionState,
 )
-from live_caption.overlay import fit_recent_lines
+from live_caption.overlay import RollUpLines, wrap_words
 from live_caption.source import DemoWorker
 
 
@@ -227,12 +227,50 @@ def test_status_requires_live_caption_scopes() -> None:
     ) == ("s1", True)
 
 
-def test_recent_line_fitting_keeps_the_latest_lines() -> None:
+def test_word_wrapping_breaks_before_a_word_that_would_overflow() -> None:
     # A monospace-like measure makes the wrapping deterministic.
-    result = fit_recent_lines(
-        "one two three four five six", lambda value: len(value), 9, max_lines=2
-    )
-    assert result == "four five\nsix"
+    assert wrap_words("one two three four five six".split(), len, 9) == [
+        ["one", "two"],
+        ["three"],
+        ["four", "five"],
+        ["six"],
+    ]
+    assert wrap_words([], len, 9) == []
+
+
+def test_roll_up_keeps_frozen_lines_stable_while_the_last_line_grows() -> None:
+    # A monospace-like measure makes the wrapping deterministic.
+    layout = RollUpLines(len, 20, max_lines=2)
+    words = "the quick brown fox jumps over the lazy dog and keeps".split()
+
+    frames = [layout.lines(words[:count]) for count in range(1, len(words) + 1)]
+
+    # Only the last line ever grows; a line that has rolled up never reflows.
+    assert frames[3] == ["the quick brown fox"]
+    assert frames[4] == ["the quick brown fox", "jumps"]
+    assert frames[7] == ["the quick brown fox", "jumps over the lazy"]
+    assert frames[8] == ["jumps over the lazy", "dog"]
+    assert all(len(frame) <= 2 for frame in frames)
+
+
+def test_roll_up_absorbs_tail_revisions_and_relays_out_a_new_transcript() -> None:
+    layout = RollUpLines(len, 20, max_lines=2)
+    words = "the quick brown fox jumps over the lazy".split()
+    layout.lines(words)
+
+    # The recognizer rewrites only its mutable tail, so the frozen line above
+    # it is untouched and the last line simply re-wraps.
+    assert layout.lines(words[:-1] + ["cat"]) == [
+        "the quick brown fox",
+        "jumps over the cat",
+    ]
+    assert layout.lines(words[:-1] + ["sleepy", "cat"]) == [
+        "jumps over the",
+        "sleepy cat",
+    ]
+
+    # Text that no longer matches the frozen lines is laid out from scratch.
+    assert layout.lines("a different sentence".split()) == ["a different sentence"]
 
 
 def test_demo_mode_uses_the_same_revision_aware_caption_state() -> None:
@@ -432,3 +470,40 @@ def test_client_reads_status_and_streams_a_partial_from_contract_server() -> Non
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=2)
+
+
+def test_main_mode_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    from live_caption import __main__ as main_module
+
+    captured_modes: list[str] = []
+
+    class DummyOverlay:
+        def __init__(self, credentials: object, *, initial_mode: str = "demo") -> None:
+            captured_modes.append(initial_mode)
+
+        def run(self) -> None:
+            pass
+
+    monkeypatch.setattr("live_caption.overlay.CaptionOverlay", DummyOverlay)
+    monkeypatch.delenv("LIVE_CAPTION_MODE", raising=False)
+
+    main_module.main([])
+    assert captured_modes[-1] == "demo"
+
+    main_module.main(["--real"])
+    assert captured_modes[-1] == "real"
+
+    main_module.main(["--demo"])
+    assert captured_modes[-1] == "demo"
+
+    main_module.main([], default_mode="real")
+    assert captured_modes[-1] == "real"
+
+    monkeypatch.setenv("LIVE_CAPTION_MODE", "real")
+    main_module.main([])
+    assert captured_modes[-1] == "real"
+
+    monkeypatch.setenv("LIVE_CAPTION_MODE", "demo")
+    main_module.main([], default_mode="real")
+    assert captured_modes[-1] == "demo"
+
