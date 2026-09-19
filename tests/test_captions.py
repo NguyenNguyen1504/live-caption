@@ -19,7 +19,11 @@ from live_caption.client import (
     validate_status,
 )
 from live_caption.credentials import CaptionCredentials
-from live_caption.model import CaptionState
+from live_caption.model import (
+    HARD_SEGMENT_WORDS,
+    SOFT_SEGMENT_WORDS,
+    CaptionState,
+)
 from live_caption.overlay import fit_recent_lines
 from live_caption.source import DemoWorker
 
@@ -51,6 +55,122 @@ def test_partial_revision_replaces_instead_of_appending() -> None:
     )
     assert state.apply(partial("stale", revision=1)) is None
     assert state.text == "Hello everyone, today we're"
+
+
+def test_first_and_every_rapid_partial_are_visible_immediately() -> None:
+    state = CaptionState()
+    words = [f"word-{index}" for index in range(1, HARD_SEGMENT_WORDS)]
+
+    for revision in range(1, len(words) + 1):
+        expected = " ".join(words[:revision])
+        assert state.apply(partial(expected, revision=revision)) == expected
+        assert state.text == expected
+
+    # Nothing in the model waits for punctuation, a timer, another word, or a
+    # final result before exposing a partial.
+    assert state.committed_segments == ()
+    assert state.active_text == " ".join(words)
+
+
+def test_short_sentence_punctuation_commits_without_waiting_for_more_words() -> None:
+    state = CaptionState()
+    assert state.apply(partial("This is ready.")) == "This is ready."
+    assert state.committed_segments == ("This is ready.",)
+    assert state.active_text == ""
+
+
+def test_punctuation_commits_sentence_and_leaves_following_words_mutable() -> None:
+    state = CaptionState()
+    state.apply(partial("The first thought ends here. another idea", revision=1))
+
+    assert state.committed_segments == ("The first thought ends here.",)
+    assert state.active_text == "another idea"
+    assert state.apply(
+        partial(
+            "The first corrected thought ends here. a better idea",
+            revision=2,
+        )
+    ) == "The first thought ends here. a better idea"
+    assert state.committed_segments == ("The first thought ends here.",)
+    assert state.active_text == "a better idea"
+
+
+def test_clause_boundary_near_soft_target_is_preferred() -> None:
+    state = CaptionState()
+    words = "one two three four five six seven eight nine ten, eleven twelve".split()
+    state.apply(partial(" ".join(words)))
+
+    assert state.committed_segments == (" ".join(words[:SOFT_SEGMENT_WORDS]),)
+    assert state.active_text == "eleven twelve"
+
+
+def test_continuous_speech_uses_soft_chunks_at_hard_mutable_limit() -> None:
+    state = CaptionState()
+    words = [f"word-{index}" for index in range(1, 38)]
+    state.apply(partial(" ".join(words)))
+
+    assert [len(chunk.split()) for chunk in state.committed_segments] == [10, 10, 10]
+    assert state.active_text == " ".join(words[30:])
+    assert len(state.active_text.split()) < HARD_SEGMENT_WORDS
+    assert state.text.split() == words
+
+
+def test_late_punctuation_in_a_large_partial_does_not_bypass_hard_limit() -> None:
+    state = CaptionState()
+    words = [f"word-{index}" for index in range(1, 24)] + ["finished."]
+    state.apply(partial(" ".join(words)))
+
+    assert state.text.split() == words
+    assert all(
+        len(chunk.split()) <= HARD_SEGMENT_WORDS
+        for chunk in state.committed_segments
+    )
+    assert state.active_text == ""
+
+
+def test_active_autocorrection_does_not_rewrite_committed_prefix() -> None:
+    state = CaptionState()
+    original = [f"word-{index}" for index in range(1, 19)]
+    state.apply(partial(" ".join(original), revision=1))
+    frozen = " ".join(original[:SOFT_SEGMENT_WORDS])
+
+    revised = original.copy()
+    revised[2] = "old-prefix-correction"
+    revised[12:15] = ["new", "active", "wording"]
+    state.apply(partial(" ".join(revised), revision=2))
+
+    assert state.committed_segments == (frozen,)
+    assert state.active_text == " ".join(revised[SOFT_SEGMENT_WORDS:])
+    assert "old-prefix-correction" not in state.text
+    assert "new active wording" in state.text
+
+
+def test_insertions_and_deletions_before_boundary_do_not_duplicate_suffix() -> None:
+    state = CaptionState()
+    original = [f"word-{index}" for index in range(1, 19)]
+    state.apply(partial(" ".join(original), revision=1))
+
+    inserted = original[:2] + ["inserted"] + original[2:] + ["word-19"]
+    state.apply(partial(" ".join(inserted), revision=2))
+    assert state.text.split() == original + ["word-19"]
+
+    deleted = original[:4] + original[5:] + ["word-19", "word-20"]
+    state.apply(partial(" ".join(deleted), revision=3))
+    assert state.text.split() == original[:SOFT_SEGMENT_WORDS] + deleted[9:]
+    assert len(state.text.split()) == len(set(state.text.split()))
+
+
+def test_new_upstream_segment_commits_previous_remainder() -> None:
+    state = CaptionState()
+    state.apply(partial("a short unfinished phrase", revision=1))
+    state.apply(
+        partial("the next phrase", segment="segment-2", start_ms=1000, revision=1)
+    )
+
+    assert state.committed_segments == ("a short unfinished phrase",)
+    assert state.active_text == "the next phrase"
+    assert state.apply(partial("late rewrite", revision=2)) is None
+    assert state.text == "a short unfinished phrase the next phrase"
 
 
 def test_segments_are_ordered_by_start_time_even_when_received_out_of_order() -> None:

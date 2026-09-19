@@ -94,6 +94,25 @@ This standalone repository does not provide microphone capture or ASR. Those
 belong to the API host and affect Real API Mode only; they do not block the
 packaged GUI or Demo Mode.
 
+### Live revision behavior
+
+The API host's ASR segment and the overlay's mutable caption segment are
+intentionally separate. Every partial is displayed as soon as the client
+receives it, while `CaptionState` commits shorter display chunks using only
+text already present in that partial:
+
+- sentence punctuation commits immediately;
+- a clause boundary already present near the 10-word soft target is preferred;
+- without punctuation, the mutable suffix can grow to 16 words, then a
+  10-word prefix is committed;
+- a new upstream `segment_id` commits the previous remainder.
+
+Later partial revisions replace only the active suffix. Committed display
+chunks stay stable until the API sends the canonical `transcript.final`, which
+supersedes all provisional text as required by the version-1 contract. These
+display boundaries do not restart the recognizer, change its audio/context
+window, add a timeout, or wait for punctuation or silence.
+
 ## Automated tests
 
 ```powershell
@@ -101,9 +120,11 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-These tests cover partial replacement, stale revisions, final supersession,
-demo events, wrapping, scope validation, a real local WebSocket connection, and
-idle ping/pong.
+These tests cover immediate and rapid partial display, punctuation and hard
+boundaries, active autocorrection, stable committed chunks, insertion/deletion
+alignment without duplicated or dropped words, stale revisions, final
+supersession, demo events, wrapping, scope validation, a real local WebSocket
+connection, and idle ping/pong.
 
 ## Privacy and behavior
 
